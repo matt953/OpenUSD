@@ -21,6 +21,12 @@
 #include <sys/resource.h>
 #endif
 
+// Android and some Linux systems don't define NOFILE in sys/param.h
+// Provide a sensible fallback for maximum number of file descriptors
+#if !defined(NOFILE)
+#define NOFILE 1024
+#endif
+
 PXR_NAMESPACE_OPEN_SCOPE
 
 // Fork the current process and close all undesired file descriptors.

@@ -75,23 +75,32 @@ def MacOS():
 if MacOS():
     import apple_utils_static as apple_utils
 
+# Always import android_utils for cross-compilation support
+import android_utils_static as android_utils
+
 def GetBuildTargetDefault():
     if MacOS():
         return apple_utils.GetBuildTargetDefault()
     else:
+        # Default to Android arm64-v8a if NDK is available
+        if android_utils.Android():
+            return android_utils.GetBuildTargetDefault()
         return ''
 
 TARGET_WASM='wasm'
 
 def GetBuildTargets():
+    targets = []
     if MacOS():
-        return apple_utils.GetBuildTargets() + [TARGET_WASM]
-    elif Linux():
-        return [TARGET_WASM]
+        targets.extend(apple_utils.GetBuildTargets())
+    # Always include Android targets for cross-compilation
+    targets.extend(android_utils.GetBuildTargets())
+    targets.append(TARGET_WASM)
+    if Linux():
+        pass  # Linux has Android + WASM
     elif Windows():
-        return [TARGET_WASM]        
-    else:
-        return []
+        pass  # Windows has Android + WASM
+    return targets
 
 def MacOSTargetEmbedded(context):
     return MacOS() and apple_utils.TargetEmbeddedOS(context)
@@ -420,9 +429,9 @@ def RunCMake(context, force, extraArgs = None, installDir = None):
         toolset = '-T "{toolset}"'.format(toolset=toolset)
 
     # On MacOS, enable the use of @rpath for relocatable builds.
-    # We do not need to do this when cross compiling for wasm.
+    # We do not need to do this when cross compiling for wasm or Android.
     osx_rpath = None
-    if MacOS() and not context.targetWasm:
+    if MacOS() and not context.targetWasm and context.buildTarget not in android_utils.ANDROID_PLATFORMS:
         osx_rpath = "-DCMAKE_MACOSX_RPATH=ON"
 
         # For macOS cross compilation, set the Xcode architecture flags.
@@ -435,6 +444,11 @@ def RunCMake(context, force, extraArgs = None, installDir = None):
 
         extraArgs.append('-DCMAKE_OSX_ARCHITECTURES={0}'.format(targetArch))
         extraArgs = apple_utils.ConfigureCMakeExtraArgs(context, extraArgs)
+
+    # For Android cross-compilation, add Android toolchain configuration
+    if context.buildTarget in android_utils.ANDROID_PLATFORMS:
+        toolchain_args = android_utils.GetCMakeToolchainArgs(context)
+        extraArgs.extend(toolchain_args)
 
     if context.ignorePaths:
         ignoredPaths = ";".join(context.ignorePaths)
@@ -755,6 +769,20 @@ def InstallZlib(context, force, buildArgs):
                     ""),
                 ("add_test(example example)",
                     ""),
+                ("    add_executable(example64 test/example.c)",
+                    ""),
+                ("    target_link_libraries(example64 zlib)",
+                    ""),
+                ("    set_target_properties(example64 PROPERTIES COMPILE_FLAGS \"-D_FILE_OFFSET_BITS=64\")",
+                    ""),
+                ("    add_test(example64 example64)",
+                    ""),
+                ("    add_executable(minigzip64 test/minigzip.c)",
+                    ""),
+                ("    target_link_libraries(minigzip64 zlib)",
+                    ""),
+                ("    set_target_properties(minigzip64 PROPERTIES COMPILE_FLAGS \"-D_FILE_OFFSET_BITS=64\")",
+                    ""),
                 ("add_library(zlib SHARED ${ZLIB_SRCS} ${ZLIB_DLL_SRCS} ${ZLIB_PUBLIC_HDRS} ${ZLIB_PRIVATE_HDRS})",
                     "# Shared library disabled for static-only builds"),
                 ("set_target_properties(zlib PROPERTIES DEFINE_SYMBOL ZLIB_DLL)",
@@ -892,7 +920,7 @@ def InstallBoost_Helper(context, force, buildArgs):
         macOSPlatformFlags = ""
         useTargetTriple = False  # visionOS uses -target instead of -arch + version-min
 
-        if MacOS() and not context.targetWasm:
+        if MacOS() and not context.targetWasm and context.buildTarget not in android_utils.ANDROID_PLATFORMS:
             # Check if we're building for visionOS (which requires -target triple + isysroot)
             if context.buildTarget in [apple_utils.TARGET_VISIONOS,
                                        apple_utils.TARGET_VISIONOS_ARM64,
@@ -946,6 +974,62 @@ def InstallBoost_Helper(context, force, buildArgs):
                                 " cflags=\"{0}\" " \
                                 " linkflags=\"{0}\"".format(compilerFlags)
             bootstrapCmd += " --with-toolset=clang"
+
+        elif context.buildTarget in android_utils.ANDROID_PLATFORMS:
+            # Android cross-compilation setup
+            ndk_path = android_utils.DetectNDK()
+            if not ndk_path:
+                raise RuntimeError("Android NDK not found")
+
+            abi = android_utils.GetAndroidABI(context.buildTarget)
+            arch = android_utils.GetAndroidArch(context.buildTarget)
+
+            # Map ABI to target triple
+            if abi == "arm64-v8a":
+                target_triple = "aarch64-linux-android28"
+            elif abi == "armeabi-v7a":
+                target_triple = "armv7a-linux-androideabi28"
+            elif abi == "x86_64":
+                target_triple = "x86_64-linux-android28"
+            elif abi == "x86":
+                target_triple = "i686-linux-android28"
+            else:
+                raise RuntimeError(f"Unsupported Android ABI: {abi}")
+
+            # Set up Android toolchain paths
+            toolchain_prefix = os.path.join(ndk_path, "toolchains/llvm/prebuilt/darwin-x86_64")
+            sysroot = os.path.join(toolchain_prefix, "sysroot")
+            clang_path = os.path.join(toolchain_prefix, "bin/clang++")
+            ar_path = os.path.join(toolchain_prefix, "bin/llvm-ar")
+            ranlib_path = os.path.join(toolchain_prefix, "bin/llvm-ranlib")
+
+            # Create user-config.jam to configure b2 for Android cross-compilation
+            # This tells b2 to use the Android NDK toolchain
+            user_config = os.path.join(sourceDir, "user-config.jam")
+
+            # C++ include paths from Android NDK
+            cxx_include = os.path.join(sysroot, "usr/include/c++/v1")
+
+            with open(user_config, 'w') as f:
+                f.write(f"using clang : android\n")
+                f.write(f": {clang_path}\n")
+                f.write(f": <archiver>{ar_path}\n")
+                f.write(f"  <ranlib>{ranlib_path}\n")
+                f.write(f"  <compileflags>--target={target_triple}\n")
+                f.write(f"  <compileflags>--sysroot={sysroot}\n")
+                f.write(f"  <compileflags>-isystem{cxx_include}\n")
+                f.write(f"  <compileflags>-D__ANDROID_API__=28\n")
+                f.write(f"  <compileflags>-fPIC\n")
+                f.write(f"  <compileflags>-std=c++17\n")
+                f.write(f"  <compileflags>-stdlib=libc++\n")
+                f.write(f"  <compileflags>-O3\n")  # CRITICAL: Add optimization
+                f.write(f"  <compileflags>-DNDEBUG\n")  # CRITICAL: Disable debug mode
+                f.write(f"  <compileflags>-g0\n")  # CRITICAL: Disable debug symbols (NDK adds -g by default)
+                f.write(f"  <linkflags>--target={target_triple}\n")
+                f.write(f"  <linkflags>--sysroot={sysroot}\n")
+                f.write(f";\n")
+
+            bootstrapCmd += f" --with-toolset=clang"
 
         Run(bootstrapCmd)
 
@@ -1020,7 +1104,7 @@ def InstallBoost_Helper(context, force, buildArgs):
             elif IsVisualStudio2017OrGreater():
                 b2_settings.append("toolset=msvc-14.1")
 
-        if MacOS():
+        if MacOS() and context.buildTarget not in android_utils.ANDROID_PLATFORMS:
             # Must specify toolset=clang to ensure install_name for boost
             # libraries includes @rpath
             b2_settings.append("toolset=clang")
@@ -1038,6 +1122,14 @@ def InstallBoost_Helper(context, force, buildArgs):
                 b2_settings.append("cxxflags=\"{0} -std=c++17 -stdlib=libc++\"".format(compilerFlags))
                 b2_settings.append("cflags=\"{0}\"".format(compilerFlags))
                 b2_settings.append("linkflags=\"{0}\"".format(compilerFlags))
+
+        elif context.buildTarget in android_utils.ANDROID_PLATFORMS:
+            # Android cross-compilation: use the android toolset defined in user-config.jam
+            b2_settings.append("toolset=clang-android")
+            b2_settings.append(f"--user-config={user_config}")
+            # Must set target-os=android to prevent b2 from detecting the host OS (macOS)
+            # and adding incorrect --target flags
+            b2_settings.append("target-os=android")
 
         if context.buildDebug:
             b2_settings.append("--debug-configuration")
@@ -1101,6 +1193,8 @@ else:
 def InstallTBB(context, force, buildArgs):
     if context.targetWasm:
         raise RuntimeError("OneTBB is required for WebAssembly builds.")
+    elif context.buildTarget in android_utils.ANDROID_PLATFORMS:
+        InstallTBB_Android(context, force, buildArgs)
     elif Windows():
         InstallTBB_Windows(context, force, buildArgs)
     elif MacOS():
@@ -1109,7 +1203,7 @@ def InstallTBB(context, force, buildArgs):
         InstallTBB_Linux(context, force, buildArgs)
 
 def InstallTBB_Windows(context, force, buildArgs):
-    with CurrentWorkingDirectory(DownloadURL(TBB_URL, context, force, 
+    with CurrentWorkingDirectory(DownloadURL(TBB_URL, context, force,
         TBB_ROOT_DIR_NAME)):
         # On Windows, we simply copy headers and pre-built DLLs to
         # the appropriate location.
@@ -1122,6 +1216,83 @@ def InstallTBB_Windows(context, force, buildArgs):
         CopyFiles(context, "lib\\intel64\\vc14\\*.*", "lib")
         CopyDirectory(context, "include\\serial", "include\\serial")
         CopyDirectory(context, "include\\tbb", "include\\tbb")
+
+def InstallTBB_Android(context, force, buildArgs):
+    with CurrentWorkingDirectory(DownloadURL(TBB_URL, context, force)):
+        # Build TBB using make for Android with static libraries
+        # Android uses the same approach as iOS - build static libraries with big_iron.inc
+
+        # Get Android NDK compiler paths
+        ndk_path = android_utils.DetectNDK()
+        if not ndk_path:
+            raise RuntimeError("Android NDK not found")
+
+        abi = android_utils.GetAndroidABI(context.buildTarget)
+        arch = android_utils.GetAndroidArch(context.buildTarget)
+
+        # Map ABI to architecture for TBB
+        if abi == "arm64-v8a":
+            tbb_arch = "arm64"
+            target_triple = "aarch64-linux-android28"
+        elif abi == "armeabi-v7a":
+            tbb_arch = "armv7"
+            target_triple = "armv7a-linux-androideabi28"
+        elif abi == "x86_64":
+            tbb_arch = "intel64"
+            target_triple = "x86_64-linux-android28"
+        elif abi == "x86":
+            tbb_arch = "ia32"
+            target_triple = "i686-linux-android28"
+        else:
+            raise RuntimeError(f"Unsupported Android ABI: {abi}")
+
+        # Set up Android toolchain environment for make
+        env = os.environ.copy()
+        toolchain_prefix = os.path.join(ndk_path, "toolchains/llvm/prebuilt/darwin-x86_64")
+        sysroot = os.path.join(toolchain_prefix, "sysroot")
+
+        # Use clang from NDK
+        env["CC"] = os.path.join(toolchain_prefix, "bin/clang")
+        env["CXX"] = os.path.join(toolchain_prefix, "bin/clang++")
+        env["AR"] = os.path.join(toolchain_prefix, "bin/llvm-ar")
+
+        # Set CFLAGS and CXXFLAGS for Android cross-compilation
+        # These are critical for clang to find the C++ standard library headers
+        # CRITICAL: Add -O3 optimization, -DNDEBUG, and -g0 to prevent debug builds (which are 10x larger!)
+        # The NDK adds -g by default, so -g0 is needed to disable debug symbols
+        android_flags = f"--target={target_triple} --sysroot={sysroot} -D__ANDROID_API__=28 -fPIC -O3 -DNDEBUG -g0"
+        env["CFLAGS"] = android_flags
+        env["CXXFLAGS"] = android_flags
+
+        # Force TBB's make system to detect Linux instead of macOS
+        # This prevents it from adding -arch, -mmacosx-version-min, and other macOS flags
+        env["tbb_os"] = "linux"
+
+        # Patch the linux.clang.inc file to ensure it doesn't add incompatible flags
+        # We need to prevent -stdlib=libc++ which is macOS-specific
+        PatchFile("build/linux.clang.inc",
+                [("-stdlib=libc++", "")])
+
+        # Build static TBB using big_iron.inc config
+        # Use linux target since Android is Linux-based, with Android NDK compilers from env
+        makeTBBCmd = 'make -j{procs} arch={arch} compiler=clang extra_inc=big_iron.inc {buildArgs}'.format(
+            arch=tbb_arch, procs=context.numJobs,
+            buildArgs=" ".join(buildArgs))
+
+        Run(makeTBBCmd, env=env)
+
+        # Build debug version too (patch Makefile like macOS/Linux do)
+        if "2020" in TBB_URL:
+            PatchFile("Makefile", [("release", "debug")])
+            Run(makeTBBCmd, env=env)
+
+        # Copy release and debug libraries
+        CopyFiles(context, "build/*_release/libtbb*.*", "lib")
+        CopyFiles(context, "build/*_debug/libtbb*.*", "lib")
+
+        # Copy headers
+        CopyDirectory(context, "include/serial", "include/serial")
+        CopyDirectory(context, "include/tbb", "include/tbb")
 
 def InstallTBB_MacOS(context, force, buildArgs):
     with CurrentWorkingDirectory(DownloadURL(TBB_URL, context, force)):
@@ -1545,15 +1716,24 @@ def InstallOpenImageIO(context, force, buildArgs):
                      '-DBUILD_SHARED_LIBS=OFF',  # CUSTOM PATCH: Static build
                      '-DUSE_FFMPEG=OFF']  # CUSTOM PATCH: Disable FFmpeg (API incompatibility)
 
-        # OIIO's FindOpenEXR module circumvents CMake's normal library 
+        # OIIO's FindOpenEXR module circumvents CMake's normal library
         # search order, which causes versions of OpenEXR installed in
         # /usr/local or other hard-coded locations in the module to
-        # take precedence over the version we've built, which would 
-        # normally be picked up when we specify CMAKE_PREFIX_PATH. 
-        # This may lead to undefined symbol errors at build or runtime. 
+        # take precedence over the version we've built, which would
+        # normally be picked up when we specify CMAKE_PREFIX_PATH.
+        # This may lead to undefined symbol errors at build or runtime.
         # So, we explicitly specify the OpenEXR we want to use here.
         extraArgs.append('-DOPENEXR_ROOT="{instDir}"'
                          .format(instDir=context.instDir))
+
+        # For Android, also explicitly set TIFF_ROOT and other dependency roots
+        # since the Android toolchain restricts find_package search paths
+        if context.buildTarget in android_utils.ANDROID_PLATFORMS:
+            extraArgs.extend([
+                '-DTIFF_ROOT="{instDir}"'.format(instDir=context.instDir),
+                '-DJPEG_ROOT="{instDir}"'.format(instDir=context.instDir),
+                '-DPNG_ROOT="{instDir}"'.format(instDir=context.instDir)
+            ])
 
         # If Ptex support is disabled in USD, disable support in OpenImageIO
         # as well. This ensures OIIO doesn't accidentally pick up a Ptex
@@ -1564,6 +1744,16 @@ def InstallOpenImageIO(context, force, buildArgs):
         # Make sure to use boost installed by the build script and not any
         # system installed boost
         extraArgs.append('-DBoost_NO_SYSTEM_PATHS=ON')
+
+        # For Android cross-compilation, allow find_package to search CMAKE_PREFIX_PATH
+        # The Android toolchain restricts package search to sysroot by default
+        if context.buildTarget in android_utils.ANDROID_PLATFORMS:
+            extraArgs.append('-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH')
+            extraArgs.append('-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH')
+            extraArgs.append('-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH')
+            # Set CMake policy CMP0144 to NEW so FindTIFF and other Find modules
+            # will use the _ROOT variables we're setting
+            extraArgs.append('-DCMAKE_POLICY_DEFAULT_CMP0144=NEW')
         # OIIO 2.5.16 requires Boost_NO_BOOST_CMAKE to be explicitly defined,
         # else it sets it to ON.
         extraArgs.append('-DBoost_NO_BOOST_CMAKE=OFF')
@@ -1638,6 +1828,40 @@ def InstallOpenSubdiv(context, force, buildArgs):
         # Use Metal for macOS and all Apple embedded systems.
         if MacOS():
             extraArgs.append('-DNO_OPENGL=ON')
+
+        # Disable OpenGL for Android (uses Vulkan instead)
+        # But enable GLSL patch shader sources to keep GPU object target
+        if context.buildTarget in android_utils.ANDROID_PLATFORMS:
+            extraArgs.extend([
+                '-DNO_OPENGL=ON',
+                '-DOSD_PATCH_SHADER_SOURCE_GLSL=ON'
+            ])
+            # Patch out the broken Android install block in OpenSubdiv
+            PatchFile("opensubdiv/osd/CMakeLists.txt",
+                      [('if (ANDROID)\n' +
+                        '    install(\n' +
+                        '        FILES\n' +
+                        '            Android.mk\n' +
+                        '        DESTINATION\n' +
+                        '            "${LIBRARY_OUTPUT_PATH_ROOT}"\n' +
+                        '        PERMISSIONS\n' +
+                        '            OWNER_READ\n' +
+                        '            GROUP_READ\n' +
+                        '            WORLD_READ )\n' +
+                        'endif()',
+                        '# Android install disabled - not needed for CMake cross-compilation\n' +
+                        '# if (ANDROID)\n' +
+                        '#     install(\n' +
+                        '#         FILES\n' +
+                        '#             Android.mk\n' +
+                        '#         DESTINATION\n' +
+                        '#             "${LIBRARY_OUTPUT_PATH_ROOT}"\n' +
+                        '#         PERMISSIONS\n' +
+                        '#             OWNER_READ\n' +
+                        '#             GROUP_READ\n' +
+                        '#             WORLD_READ )\n' +
+                        '# endif()')
+                       ], multiLineMatches=True)
 
         # Add on any user-specified extra arguments.
         extraArgs += buildArgs
@@ -1764,6 +1988,12 @@ def InstallMaterialX(context, force, buildArgs):
                         '        add_subdirectory(source/MaterialXRenderGlsl)\n' +
                         '    endif()')
                        ], multiLineMatches=True)
+
+        # For Android, disable render modules (which require X11) but keep GLSL generation
+        if context.buildTarget in android_utils.ANDROID_PLATFORMS:
+            cmakeOptions.extend([
+                '-DMATERIALX_BUILD_RENDER=OFF',
+                '-DMATERIALX_BUILD_GEN_GLSL=ON'])
 
         cmakeOptions += buildArgs
         RunCMake(context, force, cmakeOptions)
@@ -1932,6 +2162,9 @@ def InstallUSD(context, force, buildArgs):
             
         if context.buildImaging:
             extraArgs.append('-DPXR_BUILD_IMAGING=ON')
+            # Android uses OpenGL ES, not OpenGL, so disable GL support
+            if context.buildTarget in android_utils.ANDROID_PLATFORMS:
+                extraArgs.append('-DPXR_ENABLE_GL_SUPPORT=OFF')
             if context.enablePtex:
                 extraArgs.append('-DPXR_ENABLE_PTEX_SUPPORT=ON')
             else:
@@ -2028,6 +2261,13 @@ def InstallUSD(context, force, buildArgs):
         extraArgs.append('-DBoost_NO_SYSTEM_PATHS=ON')
 
         extraArgs += buildArgs
+
+        # For Android cross-compilation, allow find_package/find_library/find_path
+        # to search CMAKE_PREFIX_PATH. The Android toolchain restricts these by default.
+        if context.buildTarget in android_utils.ANDROID_PLATFORMS:
+            extraArgs.append('-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH')
+            extraArgs.append('-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH')
+            extraArgs.append('-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH')
 
         # Wasm target buils tbb and osd static library above
         if context.targetWasm:

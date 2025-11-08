@@ -145,10 +145,13 @@ def GetTargetArch(context):
     else:
         if context.targetX86:
             macTargets = TARGET_X86
-        if context.targetARM64:
+        elif context.targetARM64:
             macTargets = GetTargetArmArch()
-        if context.targetUniversal:
+        elif context.targetUniversal:
             macTargets = TARGET_X86 + ";" + GetTargetArmArch()
+        else:
+            # Default to native arch if no specific target is set
+            macTargets = GetHostArch()
     return macTargets
 
 def IsHostArm():

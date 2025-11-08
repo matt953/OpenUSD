@@ -704,7 +704,12 @@ static int
 nonLockingExecv(const char *path, char *const argv[])
 {
 #if defined(ARCH_OS_LINUX)
-     return nonLockingLinux__execve (path, argv, __environ);
+    // Android uses 'environ' instead of '__environ' (GNU extension)
+    #if defined(__ANDROID__)
+        return nonLockingLinux__execve (path, argv, environ);
+    #else
+        return nonLockingLinux__execve (path, argv, __environ);
+    #endif
 #else
      return execv(path, argv);
 #endif
