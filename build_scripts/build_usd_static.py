@@ -921,6 +921,11 @@ def InstallBoost_Helper(context, force, buildArgs):
         useTargetTriple = False  # visionOS uses -target instead of -arch + version-min
 
         if MacOS() and not context.targetWasm and context.buildTarget not in android_utils.ANDROID_PLATFORMS:
+            # Auto-detect Xcode installation (prefer beta, fall back to stable)
+            xcode_path = "/Applications/Xcode-beta.app" if os.path.exists("/Applications/Xcode-beta.app") else "/Applications/Xcode.app"
+            if not os.path.exists(xcode_path):
+                raise RuntimeError("Xcode not found at /Applications/Xcode-beta.app or /Applications/Xcode.app")
+
             # Check if we're building for visionOS (which requires -target triple + isysroot)
             if context.buildTarget in [apple_utils.TARGET_VISIONOS,
                                        apple_utils.TARGET_VISIONOS_ARM64,
@@ -930,11 +935,11 @@ def InstallBoost_Helper(context, force, buildArgs):
                 # visionOS doesn't support -m*-version-min flags, use -target triple with explicit SDK
                 if context.buildTarget in [apple_utils.TARGET_VISIONOS,
                                            apple_utils.TARGET_VISIONOS_ARM64]:
-                    macOSPlatformFlags = "-target arm64-apple-xros2.0 -isysroot /Applications/Xcode-beta.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS.sdk"
+                    macOSPlatformFlags = "-target arm64-apple-xros2.0 -isysroot {xcode}/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS.sdk".format(xcode=xcode_path)
                 elif context.buildTarget == apple_utils.TARGET_VISIONOS_SIMULATOR_ARM64:
-                    macOSPlatformFlags = "-target arm64-apple-xros2.0-simulator -isysroot /Applications/Xcode-beta.app/Contents/Developer/Platforms/XRSimulator.platform/Developer/SDKs/XRSimulator.sdk"
+                    macOSPlatformFlags = "-target arm64-apple-xros2.0-simulator -isysroot {xcode}/Contents/Developer/Platforms/XRSimulator.platform/Developer/SDKs/XRSimulator.sdk".format(xcode=xcode_path)
                 elif context.buildTarget == apple_utils.TARGET_VISIONOS_SIMULATOR_X86_64:
-                    macOSPlatformFlags = "-target x86_64-apple-xros2.0-simulator -isysroot /Applications/Xcode-beta.app/Contents/Developer/Platforms/XRSimulator.platform/Developer/SDKs/XRSimulator.sdk"
+                    macOSPlatformFlags = "-target x86_64-apple-xros2.0-simulator -isysroot {xcode}/Contents/Developer/Platforms/XRSimulator.platform/Developer/SDKs/XRSimulator.sdk".format(xcode=xcode_path)
             else:
                 # iOS and macOS use -arch + version-min flags
                 if apple_utils.GetTargetArch(context) == \
